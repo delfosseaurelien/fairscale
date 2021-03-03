@@ -98,7 +98,7 @@ class ShardedDataParallel(nn.Module):
         sync_models_at_startup: bool = True,
         reduce_buffer_size: int = 2 ** 23,
         auto_refresh_trainable: bool = True,
-        reduce_fp16: bool = False,
+        reduce_fp16: bool = True,
     ):
         super().__init__()
 
@@ -107,11 +107,6 @@ class ShardedDataParallel(nn.Module):
         self.enable_broadcast_buffers = broadcast_buffers
         self.auto_refresh_trainable = auto_refresh_trainable
         self.reduce_fp16 = reduce_fp16
-        if reduce_buffer_size > 0 and reduce_fp16:
-            self.reduce_fp16 = False
-            logging.warning(
-                "fp16 gradient reduction is not compatible with reduction buffers, which are requested. fp16 grad reduction is deactivated."
-            )
 
         # Handle a no_sync() context which prevents the gradient synchronization,
         # accumulate in place
@@ -175,6 +170,7 @@ class ShardedDataParallel(nn.Module):
         self.buckets: Dict[torch.device, Dict[int, GradBucket]] = {}
         self._should_bucket_grad: List[bool] = []
         self._bucket_list: List[GradBucket] = []
+        self._grad_fp16_buffer: List[Optional[torch.Tensor]] = []
 
         # - setup backward hooks which will be called by Torch's autograd in due time
         self._grad_accs: List[Callable] = []
@@ -371,6 +367,7 @@ class ShardedDataParallel(nn.Module):
         if self.training:
             self._grad_to_be_reduced = [True for _ in self._trainable_params]
         self._bucket_flush_callback_set = False
+        self._grad_fp16_buffer = [None for _ in self._grad_to_be_reduced]  # same size on purpose
 
         if self.use_buckets:
             for bucket in self._bucket_list:
@@ -401,24 +398,30 @@ class ShardedDataParallel(nn.Module):
 
                     # Make sure that this is not fired twice
                     self._grad_to_be_reduced[index] = False
-                    param.grad.mul_(self.world_size_scaling)
 
                     if self.reduce_fp16:
-                        param.grad.data = param.grad.data.half()
+                        self._grad_fp16_buffer[index] = param.grad.to(torch.float16, non_blocking=True)
+                        if dst_rank != self.global_rank:
+                            param.grad = None
 
                     # Future work includes clearing up the buffer if possible
                     def cleanup() -> None:
+                        if self.reduce_fp16:
+                            assert self._grad_fp16_buffer[index] is not None
+                            param.grad = self._grad_fp16_buffer[index].to(dtype=param.dtype)  # type: ignore  # mypy is drunk
+                            self._grad_fp16_buffer[index] = None
+
                         if dst_rank != self.global_rank:
                             param.grad = None
                         else:
                             assert param.grad is not None
-                            param.grad.data = param.grad.data.to(dtype=param.dtype)
+                            param.grad.mul_(self.world_size_scaling)
 
                     # Async reduce for this buffer, log the future
                     self._work_handles.append(
                         Workhandle(
                             handle=dist.reduce(
-                                tensor=param.grad.data,
+                                tensor=self._grad_fp16_buffer[index] if self.reduce_fp16 else param.grad.data,  # type: ignore  # mypy is drunk
                                 dst=self._local_to_global_rank[dst_rank],
                                 group=self.process_group,
                                 async_op=True,
@@ -451,8 +454,25 @@ class ShardedDataParallel(nn.Module):
                     if bucket.all_checked_in:
                         assert bucket.buffer is not None
 
-                        # Normalize the bucket in one go
-                        bucket.buffer.mul_(self.world_size_scaling)
+                        if self.reduce_fp16:
+                            bucket.to(
+                                dtype=torch.float16,
+                                device=bucket.buffer.device,
+                                non_blocking=False,
+                                keep_param_alignment=False,
+                            )
+
+                        def cleanup() -> None:
+                            if self.reduce_fp16:
+                                bucket.to(
+                                    dtype=torch.float32,
+                                    device=bucket.buffer.device,
+                                    non_blocking=False,
+                                    keep_param_alignment=dst_rank == self.global_rank,
+                                )
+
+                            # Normalize the bucket in one go
+                            bucket.buffer.mul_(self.world_size_scaling)
 
                         # Reduce the bucket
                         bucket.sent = True
@@ -464,7 +484,7 @@ class ShardedDataParallel(nn.Module):
                                     group=self.process_group,
                                     async_op=True,
                                 ),
-                                callback=None,
+                                callback=cleanup,
                             )
                         )
 

@@ -31,8 +31,12 @@ Check that ShardedDDP gets the same results as DDP in a variety of scenarii
 
 _test_fp16_reduction = [False]
 
-if hasattr(dist, "algorithms.ddp_com_hooks.default_hooks"):
+try:
+    from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
+
     _test_fp16_reduction.append(True)
+except ImportError:
+    pass
 
 _test_amp = [False]
 if hasattr(torch.cuda.amp, "autocast"):
@@ -125,8 +129,6 @@ def run_ddp_parity(
     ddp_model = DDP(ddp_model_single, device_ids=[rank], broadcast_buffers=True, find_unused_parameters=True)
 
     if fp16_reduction:
-        from dist.algorithms.ddp_com_hooks.default_hooks import fp16_compress_hook
-
         ddp_model.register_comm_hook(state=None, hook=fp16_compress_hook)  # type: ignore
 
     ddp_scaler = TorchGradScaler() if amp else None

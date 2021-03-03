@@ -112,7 +112,7 @@ def run_one_step(
         return loss
 
     # The models should stay the same in between the ranks
-    for i in range(5):
+    for _ in range(5):
         _ = optimizer.step(closure=closure)
 
         # For a sync of all the streams
